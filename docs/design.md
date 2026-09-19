@@ -67,9 +67,27 @@
 - `status_bar.document_stats_button` が有効であること。無効時（既定）は集計そのものを省略する。
 - `editor.buffer().read(cx).is_singleton()` が真であること（後述）。
 
-`document_stats_button` を無効から有効へ切り替えた直後は、次にバッファが編集される（またはタブが
-再アクティブ化される）までは表示が更新されない。設定変更を監視して即時再計算する仕組みは持たない
-（既定でオフの機能を有効にした直後の一瞬だけの制約であり、実用上ほぼ問題にならないと判断した）。
+### 設定変更時の即時反映（2026-09-20、レビュー指摘で追加）
+
+上記の「初版」では、`document_stats_button` を無効から有効へ切り替えても、次にバッファが編集される
+かタブが再アクティブ化されるまで表示が更新されなかった（設定変更を監視していなかったため）。
+実用上ほぼ問題にならないと判断していたが、レビューで「開いている文書で設定を有効にしても統計が
+表示されない」と指摘され、修正した。
+
+`CursorPosition` に `active_editor: Option<WeakEntity<Editor>>` を追加し、`set_active_pane_item`
+で現在のエディタを弱参照として保持する。`CursorPosition::new` で
+`cx.observe_global::<SettingsStore>(|cursor_position, cx| {...})`
+（`crates/agent_ui/src/profile_selector.rs` の `settings_subscription` 等、既存コードベースで
+広く使われている購読パターン）を一度だけ登録し、設定が変わるたびに `active_editor` を辿って
+（アップグレードできる場合のみ）文書統計を同期的に再計算する。デバウンス付き非同期タスクである
+`update_position` とは別経路（`cx.observe_global` のコールバックは `Window` を受け取らないため
+`cx.spawn_in` は使えない）だが、計算そのものは `update_position` 側と同じロジック
+（`is_singleton` 判定・設定判定・`document_stats::compute` 呼び出し）を踏襲している。
+設定変更は稀な操作なのでデバウンスは不要と判断した。
+
+`test_document_stats_populates_when_enabled_while_open` を追加し、文書を開いた直後（設定オフ）は
+統計が計算されず、その後に設定を有効化すると編集やタブ切り替えなしに即座に統計が populate される
+ことを検証する。このテストも、購読を無効化すると実際に失敗することを確認済み。
 
 ### 複数バッファ（マルチバッファ）表示での扱い
 
@@ -115,6 +133,10 @@
   `CursorPosition::set_active_pane_item` に直接渡し、`is_singleton` が偽のときは文書統計の設定を
   有効にしていても `None` のままであることを検証する。このテストは実際に `is_singleton` の
   ガードを外すと失敗することを手元で確認済み（回帰検出力の確認）。
+- `test_document_stats_populates_when_enabled_while_open`: 設定オフのまま文書を開き、統計が
+  計算されないことを確認した後、その場で設定を有効化し、編集やタブ切り替えを挟まずに統計が
+  即座に populate されることを検証する。`cx.observe_global::<SettingsStore>` の購読を
+  無効化すると実際に失敗することを手元で確認済み。
 
 `CursorPosition::document_stats()` という `#[cfg(test)]` アクセサを、既存の `selection_stats()`／
 `position()` に倣って追加した。

@@ -14,14 +14,18 @@ index 3f1eca5..626f64e 100644
      // input is pending. Hovering the indicator pauses the timeout. Its binding
      // preview popover is disabled when "which_key.enabled" is true.
 diff --git a/crates/go_to_line/src/cursor_position.rs b/crates/go_to_line/src/cursor_position.rs
-index 29f1c0a..166fab0 100644
+index 29f1c0a..31f9157 100644
 --- a/crates/go_to_line/src/cursor_position.rs
 +++ b/crates/go_to_line/src/cursor_position.rs
-@@ -1,3 +1,4 @@
+@@ -1,6 +1,7 @@
 +use crate::document_stats::{self, DocumentStatsValues};
  use editor::{Editor, EditorEvent, MBTextSummary, MultiBufferSnapshot};
  use gpui::{App, Entity, FocusHandle, Focusable, Styled, Subscription, Task, WeakEntity};
- use settings::{RegisterSetting, Settings};
+-use settings::{RegisterSetting, Settings};
++use settings::{RegisterSetting, Settings, SettingsStore};
+ use std::{fmt::Write, num::NonZeroU32, time::Duration};
+ use text::{Point, Selection};
+ use ui::{
 @@ -8,7 +9,10 @@ use ui::{
      Render, Tooltip, Window, div,
  };
@@ -34,23 +38,66 @@ index 29f1c0a..166fab0 100644
  
  #[derive(Copy, Clone, Debug, Default, PartialOrd, PartialEq)]
  pub(crate) struct SelectionStats {
-@@ -20,6 +24,7 @@ pub(crate) struct SelectionStats {
+@@ -20,10 +24,13 @@ pub(crate) struct SelectionStats {
  pub struct CursorPosition {
      position: Option<UserCaretPosition>,
      selected_count: SelectionStats,
 +    document_stats: Option<DocumentStatsValues>,
      context: Option<FocusHandle>,
      workspace: WeakEntity<Workspace>,
++    active_editor: Option<WeakEntity<Editor>>,
      update_position: Task<()>,
-@@ -72,6 +77,7 @@ impl CursorPosition {
+     _observe_active_editor: Option<Subscription>,
++    _observe_document_stats_setting: Subscription,
+ }
+ 
+ /// A position in the editor, where user's caret is located at.
+@@ -67,14 +74,43 @@ impl UserCaretPosition {
+ }
+ 
+ impl CursorPosition {
+-    pub fn new(workspace: &Workspace) -> Self {
++    pub fn new(workspace: &Workspace, cx: &mut Context<Self>) -> Self {
++        // Toggling `document_stats_button` on with a document already open must
++        // populate its stats immediately, not wait for the next edit or tab
++        // switch (`update_position` is otherwise only driven by editor events).
++        let _observe_document_stats_setting =
++            cx.observe_global::<SettingsStore>(|cursor_position, cx| {
++                let Some(editor) = cursor_position
++                    .active_editor
++                    .as_ref()
++                    .and_then(|editor| editor.upgrade())
++                else {
++                    return;
++                };
++                cursor_position.document_stats = editor.update(cx, |editor, cx| {
++                    match editor.mode() {
++                        editor::EditorMode::Full { .. } => {
++                            let is_singleton = editor.buffer().read(cx).is_singleton();
++                            let snapshot = editor.display_snapshot(cx);
++                            (is_singleton && StatusBarSettings::get_global(cx).document_stats_button)
++                                .then(|| document_stats::compute(snapshot.buffer_snapshot()))
++                        }
++                        _ => None,
++                    }
++                });
++                cx.notify();
++            });
++
+         Self {
              position: None,
              context: None,
              selected_count: Default::default(),
 +            document_stats: None,
++            active_editor: None,
              workspace: workspace.weak_handle(),
              update_position: Task::ready(()),
              _observe_active_editor: None,
-@@ -82,6 +88,7 @@ impl CursorPosition {
++            _observe_document_stats_setting,
+         }
+     }
+ 
+@@ -82,6 +118,7 @@ impl CursorPosition {
          &mut self,
          editor: &Entity<Editor>,
          debounce: Option<Duration>,
@@ -58,7 +105,7 @@ index 29f1c0a..166fab0 100644
          window: &mut Window,
          cx: &mut Context<Self>,
      ) {
-@@ -106,11 +113,28 @@ impl CursorPosition {
+@@ -106,11 +143,28 @@ impl CursorPosition {
                              | editor::EditorMode::SingleLine
                              | editor::EditorMode::Minimap { .. } => {
                                  cursor_position.position = None;
@@ -87,7 +134,7 @@ index 29f1c0a..166fab0 100644
                                  if snapshot.buffer_snapshot().excerpts().count() > 0 {
                                      for selection in editor.selections.all_adjusted(&snapshot) {
                                          let selection_summary = snapshot
-@@ -205,6 +229,37 @@ impl CursorPosition {
+@@ -205,6 +259,37 @@ impl CursorPosition {
      pub(crate) fn position(&self) -> Option<UserCaretPosition> {
          self.position
      }
@@ -125,7 +172,7 @@ index 29f1c0a..166fab0 100644
  }
  
  impl Render for CursorPosition {
-@@ -214,11 +269,30 @@ impl Render for CursorPosition {
+@@ -214,11 +299,30 @@ impl Render for CursorPosition {
          }
  
          div().when_some(self.position, |el, position| {
@@ -160,7 +207,15 @@ index 29f1c0a..166fab0 100644
  
              let context = self.context.clone();
  
-@@ -281,13 +355,22 @@ impl StatusItemView for CursorPosition {
+@@ -273,6 +377,7 @@ impl StatusItemView for CursorPosition {
+         cx: &mut Context<Self>,
+     ) {
+         if let Some(editor) = active_pane_item.and_then(|item| item.act_as::<Editor>(cx)) {
++            self.active_editor = Some(editor.downgrade());
+             self._observe_active_editor = Some(cx.subscribe_in(
+                 &editor,
+                 window,
+@@ -281,15 +386,25 @@ impl StatusItemView for CursorPosition {
                          cursor_position,
                          editor,
                          Some(UPDATE_DEBOUNCE),
@@ -183,7 +238,10 @@ index 29f1c0a..166fab0 100644
 +            self.update_position(&editor, None, true, window, cx);
          } else {
              self.position = None;
++            self.active_editor = None;
              self._observe_active_editor = None;
+         }
+ 
 diff --git a/crates/go_to_line/src/document_stats.rs b/crates/go_to_line/src/document_stats.rs
 new file mode 100644
 index 0000000..f265cb9
@@ -248,7 +306,7 @@ index 0000000..f265cb9
 +    blocks
 +}
 diff --git a/crates/go_to_line/src/go_to_line.rs b/crates/go_to_line/src/go_to_line.rs
-index 48017a6..b996d1d 100644
+index 48017a6..b0aa217 100644
 --- a/crates/go_to_line/src/go_to_line.rs
 +++ b/crates/go_to_line/src/go_to_line.rs
 @@ -1,4 +1,5 @@
@@ -276,7 +334,16 @@ index 48017a6..b996d1d 100644
  
      #[gpui::test]
      async fn test_go_to_line_view_row_highlights(cx: &mut TestAppContext) {
-@@ -606,6 +608,208 @@ mod tests {
+@@ -539,7 +541,7 @@ mod tests {
+             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+         workspace.update_in(cx, |workspace, window, cx| {
+-            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
+             workspace.status_bar().update(cx, |status_bar, cx| {
+                 status_bar.add_right_item(cursor_position, window, cx);
+             });
+@@ -606,6 +608,285 @@ mod tests {
          });
      }
  
@@ -300,7 +367,7 @@ index 48017a6..b996d1d 100644
 +            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
 +        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 +        workspace.update_in(cx, |workspace, window, cx| {
-+            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
 +            workspace.status_bar().update(cx, |status_bar, cx| {
 +                status_bar.add_right_item(cursor_position, window, cx);
 +            });
@@ -381,7 +448,7 @@ index 48017a6..b996d1d 100644
 +            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
 +        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
 +        workspace.update_in(cx, |workspace, window, cx| {
-+            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
 +            workspace.status_bar().update(cx, |status_bar, cx| {
 +                status_bar.add_right_item(cursor_position, window, cx);
 +            });
@@ -424,6 +491,83 @@ index 48017a6..b996d1d 100644
 +    }
 +
 +    #[gpui::test]
++    async fn test_document_stats_populates_when_enabled_while_open(cx: &mut TestAppContext) {
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/dir"), json!({ "a.txt": "one\ntwo\nthree" }))
++            .await;
++
++        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        workspace.update_in(cx, |workspace, window, cx| {
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
++            workspace.status_bar().update(cx, |status_bar, cx| {
++                status_bar.add_right_item(cursor_position, window, cx);
++            });
++        });
++
++        let worktree_id = workspace.update(cx, |workspace, cx| {
++            workspace.project().update(cx, |project, cx| {
++                project.worktrees(cx).next().unwrap().read(cx).id()
++            })
++        });
++        let _buffer = project
++            .update(cx, |project, cx| {
++                project.open_local_buffer(path!("/dir/a.txt"), cx)
++            })
++            .await
++            .unwrap();
++        let _editor = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_path((worktree_id, rel_path("a.txt")), None, true, window, cx)
++            })
++            .await
++            .unwrap()
++            .downcast::<Editor>()
++            .unwrap();
++
++        cx.executor().advance_clock(Duration::from_millis(200));
++        workspace.update(cx, |workspace, cx| {
++            let document_stats = workspace
++                .status_bar()
++                .read(cx)
++                .item_of_type::<CursorPosition>()
++                .expect("missing cursor position item")
++                .read(cx)
++                .document_stats();
++            assert_eq!(document_stats, None, "stats must not be computed before the setting is enabled");
++        });
++
++        // Enabling the setting on an already-open document, without any
++        // subsequent edit or tab switch, must populate its stats immediately.
++        cx.update(|_, cx| {
++            SettingsStore::update_global(cx, |settings, cx| {
++                settings.update_user_settings(cx, |settings| {
++                    settings.status_bar.get_or_insert_default().document_stats_button = Some(true);
++                });
++            });
++        });
++
++        workspace.update(cx, |workspace, cx| {
++            let document_stats = workspace
++                .status_bar()
++                .read(cx)
++                .item_of_type::<CursorPosition>()
++                .expect("missing cursor position item")
++                .read(cx)
++                .document_stats()
++                .expect(
++                    "enabling the setting on an already-open document should populate stats \
++                     immediately, without needing an edit or tab switch",
++                );
++            assert_eq!(document_stats.lines, 3);
++        });
++    }
++
++    #[gpui::test]
 +    async fn test_document_stats_hidden_for_multibuffer(cx: &mut TestAppContext) {
 +        init_test(cx);
 +        enable_document_stats(cx);
@@ -461,7 +605,7 @@ index 48017a6..b996d1d 100644
 +        });
 +
 +        let cursor_position = workspace.update_in(cx, |workspace, window, cx| {
-+            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
 +            workspace.status_bar().update(cx, |status_bar, cx| {
 +                status_bar.add_right_item(cursor_position.clone(), window, cx);
 +            });
@@ -485,7 +629,25 @@ index 48017a6..b996d1d 100644
      #[gpui::test]
      async fn test_unicode_line_numbers(cx: &mut TestAppContext) {
          init_test(cx);
-@@ -892,6 +1096,16 @@ mod tests {
+@@ -625,7 +906,7 @@ mod tests {
+             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+         workspace.update_in(cx, |workspace, window, cx| {
+-            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
+             workspace.status_bar().update(cx, |status_bar, cx| {
+                 status_bar.add_right_item(cursor_position, window, cx);
+             });
+@@ -704,7 +985,7 @@ mod tests {
+             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+         let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+         workspace.update_in(cx, |workspace, window, cx| {
+-            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            let cursor_position = cx.new(|cx| CursorPosition::new(workspace, cx));
+             workspace.status_bar().update(cx, |status_bar, cx| {
+                 status_bar.add_right_item(cursor_position, window, cx);
+             });
+@@ -892,6 +1173,16 @@ mod tests {
          })
      }
  
@@ -691,3 +853,16 @@ index eff3a0a..b31445e 100644
          }
      }
  }
+diff --git a/crates/zed/src/zed.rs b/crates/zed/src/zed.rs
+index 2bce5d0..8842413 100644
+--- a/crates/zed/src/zed.rs
++++ b/crates/zed/src/zed.rs
+@@ -624,7 +624,7 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
+         });
+ 
+         let cursor_position =
+-            cx.new(|_| go_to_line::cursor_position::CursorPosition::new(workspace));
++            cx.new(|cx| go_to_line::cursor_position::CursorPosition::new(workspace, cx));
+         let line_ending_indicator =
+             cx.new(|_| line_ending_selector::LineEndingIndicator::default());
+         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
