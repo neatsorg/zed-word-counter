@@ -1,0 +1,504 @@
+diff --git a/assets/settings/default.json b/assets/settings/default.json
+index 3f1eca5..626f64e 100644
+--- a/assets/settings/default.json
++++ b/assets/settings/default.json
+@@ -1959,6 +1959,10 @@
+     "line_endings_button": false,
+     // Control when to show the active encoding in the status bar.
+     "active_encoding_button": "non_utf8",
++    // Whether to show document-wide statistics (total lines, characters, blocks) next
++    // to the cursor position button in the status bar. Always reflects the whole
++    // active document, not just the current selection.
++    "document_stats_button": false,
+     // Whether to show an indicator with a countdown while timed multi-stroke
+     // input is pending. Hovering the indicator pauses the timeout. Its binding
+     // preview popover is disabled when "which_key.enabled" is true.
+diff --git a/crates/go_to_line/src/cursor_position.rs b/crates/go_to_line/src/cursor_position.rs
+index 29f1c0a..c605450 100644
+--- a/crates/go_to_line/src/cursor_position.rs
++++ b/crates/go_to_line/src/cursor_position.rs
+@@ -1,3 +1,4 @@
++use crate::document_stats::{self, DocumentStatsValues};
+ use editor::{Editor, EditorEvent, MBTextSummary, MultiBufferSnapshot};
+ use gpui::{App, Entity, FocusHandle, Focusable, Styled, Subscription, Task, WeakEntity};
+ use settings::{RegisterSetting, Settings};
+@@ -8,7 +9,10 @@ use ui::{
+     Render, Tooltip, Window, div,
+ };
+ use util::paths::FILE_ROW_COLUMN_DELIMITER;
+-use workspace::{HideStatusItem, StatusBarSettings, StatusItemView, Workspace, item::ItemHandle};
++use workspace::{
++    DocumentStats as DocumentStatsSettings, HideStatusItem, StatusBarSettings, StatusItemView,
++    Workspace, item::ItemHandle,
++};
+ 
+ #[derive(Copy, Clone, Debug, Default, PartialOrd, PartialEq)]
+ pub(crate) struct SelectionStats {
+@@ -20,6 +24,7 @@ pub(crate) struct SelectionStats {
+ pub struct CursorPosition {
+     position: Option<UserCaretPosition>,
+     selected_count: SelectionStats,
++    document_stats: Option<DocumentStatsValues>,
+     context: Option<FocusHandle>,
+     workspace: WeakEntity<Workspace>,
+     update_position: Task<()>,
+@@ -72,6 +77,7 @@ impl CursorPosition {
+             position: None,
+             context: None,
+             selected_count: Default::default(),
++            document_stats: None,
+             workspace: workspace.weak_handle(),
+             update_position: Task::ready(()),
+             _observe_active_editor: None,
+@@ -106,11 +112,14 @@ impl CursorPosition {
+                             | editor::EditorMode::SingleLine
+                             | editor::EditorMode::Minimap { .. } => {
+                                 cursor_position.position = None;
++                                cursor_position.document_stats = None;
+                                 cursor_position.context = None;
+                             }
+                             editor::EditorMode::Full { .. } => {
+                                 let mut last_selection = None::<Selection<Point>>;
+                                 let snapshot = editor.display_snapshot(cx);
++                                cursor_position.document_stats =
++                                    Some(document_stats::compute(snapshot.buffer_snapshot()));
+                                 if snapshot.buffer_snapshot().excerpts().count() > 0 {
+                                     for selection in editor.selections.all_adjusted(&snapshot) {
+                                         let selection_summary = snapshot
+@@ -205,6 +214,37 @@ impl CursorPosition {
+     pub(crate) fn position(&self) -> Option<UserCaretPosition> {
+         self.position
+     }
++
++    #[cfg(test)]
++    pub(crate) fn document_stats(&self) -> Option<DocumentStatsValues> {
++        self.document_stats
++    }
++}
++
++/// Appends the configured document-wide statistics (for example "120 chars, 4 blocks")
++/// to `text`, unconditionally (unlike [`CursorPosition::write_position`], this does not
++/// depend on whether anything is selected). Pure formatting: takes the already-computed
++/// values and resolved settings, so it has no dependency on `CursorPosition` itself.
++fn write_document_stats(
++    values: &DocumentStatsValues,
++    settings: &DocumentStatsSettings,
++    text: &mut String,
++) {
++    if settings.items.is_empty() {
++        return;
++    }
++    write!(text, " — ").unwrap();
++    for (index, (item, label)) in settings.items.iter().enumerate() {
++        if index > 0 {
++            text.push_str(&settings.separator);
++        }
++        let count = match item {
++            settings::DocumentStatsItem::Lines => values.lines as usize,
++            settings::DocumentStatsItem::Characters => values.characters,
++            settings::DocumentStatsItem::Blocks => values.blocks,
++        };
++        write!(text, "{count} {label}").unwrap();
++    }
+ }
+ 
+ impl Render for CursorPosition {
+@@ -214,11 +254,30 @@ impl Render for CursorPosition {
+         }
+ 
+         div().when_some(self.position, |el, position| {
+-            let mut text = format!(
+-                "{}{FILE_ROW_COLUMN_DELIMITER}{}",
+-                position.line, position.character,
+-            );
++            let status_bar_settings = StatusBarSettings::get_global(cx);
++            let mut text = if status_bar_settings.document_stats_button
++                && let Some(document_stats) = self.document_stats.as_ref()
++            {
++                format!(
++                    "{}/{}{FILE_ROW_COLUMN_DELIMITER}{}",
++                    position.line, document_stats.lines, position.character,
++                )
++            } else {
++                format!(
++                    "{}{FILE_ROW_COLUMN_DELIMITER}{}",
++                    position.line, position.character,
++                )
++            };
+             self.write_position(&mut text, cx);
++            if status_bar_settings.document_stats_button
++                && let Some(document_stats) = self.document_stats.as_ref()
++            {
++                write_document_stats(
++                    document_stats,
++                    &status_bar_settings.document_stats,
++                    &mut text,
++                );
++            }
+ 
+             let context = self.context.clone();
+ 
+@@ -277,13 +336,15 @@ impl StatusItemView for CursorPosition {
+                 &editor,
+                 window,
+                 |cursor_position, editor, event, window, cx| match event {
+-                    EditorEvent::SelectionsChanged { .. } => Self::update_position(
+-                        cursor_position,
+-                        editor,
+-                        Some(UPDATE_DEBOUNCE),
+-                        window,
+-                        cx,
+-                    ),
++                    EditorEvent::SelectionsChanged { .. } | EditorEvent::BufferEdited => {
++                        Self::update_position(
++                            cursor_position,
++                            editor,
++                            Some(UPDATE_DEBOUNCE),
++                            window,
++                            cx,
++                        )
++                    }
+                     _ => {}
+                 },
+             ));
+diff --git a/crates/go_to_line/src/document_stats.rs b/crates/go_to_line/src/document_stats.rs
+new file mode 100644
+index 0000000..f265cb9
+--- /dev/null
++++ b/crates/go_to_line/src/document_stats.rs
+@@ -0,0 +1,57 @@
++use multi_buffer::{MultiBufferRow, MultiBufferSnapshot};
++
++/// Whole-document statistics: total line count, total character count, and the
++/// number of blocks (paragraphs) in the document.
++///
++/// This module intentionally has no dependency on `editor`, `gpui`, or `settings`,
++/// so that the aggregation logic can be reused by status bar items other than
++/// [`crate::cursor_position::CursorPosition`] without pulling in its rendering code.
++#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
++pub struct DocumentStatsValues {
++    /// The total number of lines in the document, based on line breaks in the
++    /// buffer contents (not on soft wrapping).
++    pub lines: u32,
++    /// The total number of characters (Unicode code points) in the document.
++    pub characters: usize,
++    /// The number of blocks (paragraphs) in the document. A block is a maximal
++    /// run of one or more non-empty lines. Two or more consecutive empty lines
++    /// separate blocks; a single line break does not. A line containing only
++    /// whitespace (spaces/tabs) is not considered empty for this purpose.
++    pub blocks: usize,
++}
++
++/// Computes whole-document statistics for `snapshot`.
++///
++/// Total line and character counts are read from the buffer's cached rope
++/// summary (`O(log n)`), so they are cheap even for large documents. Counting
++/// blocks requires a single pass over every row (`O(number of lines)`) since
++/// blank-line runs are not tracked by the rope summary; callers computing this
++/// for large documents on every keystroke should debounce/background the call.
++pub fn compute(snapshot: &MultiBufferSnapshot) -> DocumentStatsValues {
++    let text_summary = snapshot.text_summary();
++    let max_row = text_summary.lines.row;
++    let lines = max_row + 1;
++    let characters = text_summary.chars;
++    let blocks = count_blocks(snapshot, max_row);
++
++    DocumentStatsValues {
++        lines,
++        characters,
++        blocks,
++    }
++}
++
++fn count_blocks(snapshot: &MultiBufferSnapshot, max_row: u32) -> usize {
++    let mut blocks = 0usize;
++    let mut in_block = false;
++    for row in 0..=max_row {
++        let is_empty_line = snapshot.line_len(MultiBufferRow(row)) == 0;
++        if is_empty_line {
++            in_block = false;
++        } else if !in_block {
++            blocks += 1;
++            in_block = true;
++        }
++    }
++    blocks
++}
+diff --git a/crates/go_to_line/src/go_to_line.rs b/crates/go_to_line/src/go_to_line.rs
+index 48017a6..078ffd3 100644
+--- a/crates/go_to_line/src/go_to_line.rs
++++ b/crates/go_to_line/src/go_to_line.rs
+@@ -1,4 +1,5 @@
+ pub mod cursor_position;
++pub mod document_stats;
+ 
+ use cursor_position::UserCaretPosition;
+ use editor::{
+@@ -606,6 +607,78 @@ mod tests {
+         });
+     }
+ 
++    #[gpui::test]
++    async fn test_document_stats(cx: &mut TestAppContext) {
++        init_test(cx);
++
++        // Blocks (paragraphs): a run of consecutive non-empty lines. Two or more
++        // consecutive empty lines separate blocks (rows 2-3); a single line break
++        // does not (row 6, within the second block); a whitespace-only line does
++        // not count as empty, so it does not split a block either (row 5).
++        // No trailing newline, so this is exactly 9 lines / 3 blocks.
++        let text = "para one\nstill one\n\n\npara two\n   \npara two continued\n\npara three";
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/dir"), json!({ "a.txt": text })).await;
++
++        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        workspace.update_in(cx, |workspace, window, cx| {
++            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            workspace.status_bar().update(cx, |status_bar, cx| {
++                status_bar.add_right_item(cursor_position, window, cx);
++            });
++        });
++
++        let worktree_id = workspace.update(cx, |workspace, cx| {
++            workspace.project().update(cx, |project, cx| {
++                project.worktrees(cx).next().unwrap().read(cx).id()
++            })
++        });
++        let _buffer = project
++            .update(cx, |project, cx| {
++                project.open_local_buffer(path!("/dir/a.txt"), cx)
++            })
++            .await
++            .unwrap();
++        let _editor = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_path((worktree_id, rel_path("a.txt")), None, true, window, cx)
++            })
++            .await
++            .unwrap()
++            .downcast::<Editor>()
++            .unwrap();
++
++        cx.executor().advance_clock(Duration::from_millis(200));
++        workspace.update(cx, |workspace, cx| {
++            let document_stats = workspace
++                .status_bar()
++                .read(cx)
++                .item_of_type::<CursorPosition>()
++                .expect("missing cursor position item")
++                .read(cx)
++                .document_stats()
++                .expect("document stats should always be computed for a full editor, regardless of selection");
++            assert_eq!(
++                document_stats.lines, 9,
++                "total line count should follow line breaks in the buffer, not the current selection"
++            );
++            assert_eq!(
++                document_stats.characters,
++                text.chars().count(),
++                "character count should cover the whole document"
++            );
++            assert_eq!(
++                document_stats.blocks, 3,
++                "blocks are separated by two or more consecutive empty lines; \
++                 a single line break or a whitespace-only line must not split a block"
++            );
++        });
++    }
++
+     #[gpui::test]
+     async fn test_unicode_line_numbers(cx: &mut TestAppContext) {
+         init_test(cx);
+diff --git a/crates/settings/src/vscode_import.rs b/crates/settings/src/vscode_import.rs
+index 997625f..f43cb33 100644
+--- a/crates/settings/src/vscode_import.rs
++++ b/crates/settings/src/vscode_import.rs
+@@ -832,6 +832,8 @@ impl VsCodeSettings {
+             line_endings_button: None,
+             active_encoding_button: None,
+             pending_keystrokes_indicator: None,
++            document_stats_button: None,
++            document_stats: None,
+         })
+     }
+ 
+diff --git a/crates/settings_content/src/workspace.rs b/crates/settings_content/src/workspace.rs
+index e38b902..858e2ca 100644
+--- a/crates/settings_content/src/workspace.rs
++++ b/crates/settings_content/src/workspace.rs
+@@ -587,6 +587,64 @@ pub struct StatusBarSettingsContent {
+     ///
+     /// Default: true
+     pub pending_keystrokes_indicator: Option<bool>,
++    /// Whether to show document-wide statistics (total lines, characters, blocks) next to the
++    /// cursor position button in the status bar. Always reflects the whole active document,
++    /// not just the current selection.
++    ///
++    /// Default: false
++    pub document_stats_button: Option<bool>,
++    /// Configuration for the document statistics display (see `document_stats_button`).
++    pub document_stats: Option<DocumentStatsSettingsContent>,
++}
++
++/// A single statistic that can be shown in the document statistics display.
++#[derive(
++    Copy,
++    Clone,
++    Debug,
++    Eq,
++    PartialEq,
++    Serialize,
++    Deserialize,
++    JsonSchema,
++    MergeFrom,
++    strum::VariantNames,
++    strum::VariantArray,
++)]
++#[serde(rename_all = "snake_case")]
++pub enum DocumentStatsItem {
++    /// The total number of lines in the document.
++    Lines,
++    /// The total number of characters in the document.
++    Characters,
++    /// The number of blocks (paragraphs) in the document, where a block is a run of
++    /// non-empty lines separated by one or more empty lines.
++    Blocks,
++}
++
++/// A single entry in the document statistics display: which statistic to show, and
++/// optionally a custom label overriding the built-in one.
++#[with_fallible_options]
++#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
++pub struct DocumentStatsItemContent {
++    /// Which statistic this entry displays.
++    pub item: DocumentStatsItem,
++    /// Custom label text for this entry. Defaults to a built-in label for `item`
++    /// (for example, "chars" for `characters`) when not set.
++    pub label: Option<String>,
++}
++
++#[with_fallible_options]
++#[derive(Clone, Default, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema, MergeFrom)]
++pub struct DocumentStatsSettingsContent {
++    /// Which statistics to display, and in what order.
++    ///
++    /// Default: [{"item": "characters"}, {"item": "blocks"}]
++    pub items: Option<Vec<DocumentStatsItemContent>>,
++    /// Text inserted between consecutive statistics.
++    ///
++    /// Default: ", "
++    pub separator: Option<String>,
+ }
+ 
+ #[derive(
+diff --git a/crates/workspace/src/workspace.rs b/crates/workspace/src/workspace.rs
+index 70cf387..f2736ae 100644
+--- a/crates/workspace/src/workspace.rs
++++ b/crates/workspace/src/workspace.rs
+@@ -158,9 +158,9 @@ use util::{
+ };
+ use uuid::Uuid;
+ pub use workspace_settings::{
+-    AccessibleMode, AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, FocusFollowsMouse,
+-    RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings, WorkspaceSettings,
+-    closing_last_window_quits_app, observe_accessible_mode,
++    AccessibleMode, AutosaveSetting, BottomDockLayout, DocumentStats, EncodingDisplayOptions,
++    FocusFollowsMouse, RestoreOnStartupBehavior, StatusBarSettings, TabBarSettings,
++    WorkspaceSettings, closing_last_window_quits_app, observe_accessible_mode,
+ };
+ use zed_actions::{Spawn, feedback::FileBugReport, theme::ToggleMode};
+ 
+diff --git a/crates/workspace/src/workspace_settings.rs b/crates/workspace/src/workspace_settings.rs
+index eff3a0a..b31445e 100644
+--- a/crates/workspace/src/workspace_settings.rs
++++ b/crates/workspace/src/workspace_settings.rs
+@@ -2,7 +2,7 @@ use std::{num::NonZeroUsize, time::Duration};
+ 
+ use crate::DockPosition;
+ use collections::HashMap;
+-use gpui::{App, Subscription};
++use gpui::{App, SharedString, Subscription};
+ use serde::Deserialize;
+ pub use settings::{
+     AutosaveSetting, BottomDockLayout, EncodingDisplayOptions, InactiveOpacity,
+@@ -213,7 +213,7 @@ impl Settings for TabBarSettings {
+     }
+ }
+ 
+-#[derive(Deserialize, RegisterSetting)]
++#[derive(RegisterSetting)]
+ pub struct StatusBarSettings {
+     pub show: bool,
+     pub show_active_file: bool,
+@@ -222,6 +222,58 @@ pub struct StatusBarSettings {
+     pub line_endings_button: bool,
+     pub active_encoding_button: EncodingDisplayOptions,
+     pub pending_keystrokes_indicator: bool,
++    pub document_stats_button: bool,
++    pub document_stats: DocumentStats,
++}
++
++/// Resolved (defaults-applied) configuration for the document statistics display.
++/// See [`settings::DocumentStatsSettingsContent`] for the raw user-facing settings.
++#[derive(Clone, Debug, Default)]
++pub struct DocumentStats {
++    /// Which statistics to display, in order, paired with their resolved label.
++    pub items: Vec<(settings::DocumentStatsItem, SharedString)>,
++    /// Text inserted between consecutive statistics.
++    pub separator: String,
++}
++
++impl DocumentStats {
++    fn default_label(item: settings::DocumentStatsItem) -> &'static str {
++        match item {
++            settings::DocumentStatsItem::Lines => "lines",
++            settings::DocumentStatsItem::Characters => "chars",
++            settings::DocumentStatsItem::Blocks => "blocks",
++        }
++    }
++
++    fn from_content(content: Option<&settings::DocumentStatsSettingsContent>) -> Self {
++        let items = content
++            .and_then(|content| content.items.clone())
++            .unwrap_or_else(|| {
++                vec![
++                    settings::DocumentStatsItemContent {
++                        item: settings::DocumentStatsItem::Characters,
++                        label: None,
++                    },
++                    settings::DocumentStatsItemContent {
++                        item: settings::DocumentStatsItem::Blocks,
++                        label: None,
++                    },
++                ]
++            })
++            .into_iter()
++            .map(|entry| {
++                let label = entry
++                    .label
++                    .map(SharedString::from)
++                    .unwrap_or_else(|| Self::default_label(entry.item).into());
++                (entry.item, label)
++            })
++            .collect();
++        let separator = content
++            .and_then(|content| content.separator.clone())
++            .unwrap_or_else(|| ", ".to_string());
++        Self { items, separator }
++    }
+ }
+ 
+ impl Settings for StatusBarSettings {
+@@ -235,6 +287,8 @@ impl Settings for StatusBarSettings {
+             line_endings_button: status_bar.line_endings_button.unwrap(),
+             active_encoding_button: status_bar.active_encoding_button.unwrap(),
+             pending_keystrokes_indicator: status_bar.pending_keystrokes_indicator.unwrap(),
++            document_stats_button: status_bar.document_stats_button.unwrap(),
++            document_stats: DocumentStats::from_content(status_bar.document_stats.as_ref()),
+         }
+     }
+ }

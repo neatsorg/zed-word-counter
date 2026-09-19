@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Type-checks and tests the patched checkout produced by scripts/prepare.
+#
+# Deliberately does NOT set CARGO_TARGET_DIR outside .checkout/zed: Zed's
+# dev-mode asset loading (util::dev_repo_root) locates the checkout by
+# walking up from the *build output's* path looking for a `.git` entry. If
+# CARGO_TARGET_DIR points outside .checkout/zed, that walk finds the wrong
+# repository (e.g. this one) and every #[gpui::test] fails trying to load
+# assets/settings/default.json -- even on an unpatched checkout. Keep target/
+# inside .checkout/zed so the walk lands on the right .git.
+set -euo pipefail
+
+root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+checkout_dir="$root_dir/.checkout/zed"
+
+if [[ ! -d "$checkout_dir/.git" ]]; then
+    echo "error: $checkout_dir not found; run scripts/prepare first." >&2
+    exit 1
+fi
+
+cd "$checkout_dir"
+unset CARGO_TARGET_DIR
+cargo check -p go_to_line
+cargo test -p go_to_line --lib
