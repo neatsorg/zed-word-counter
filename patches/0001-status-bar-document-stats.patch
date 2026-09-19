@@ -14,7 +14,7 @@ index 3f1eca5..626f64e 100644
      // input is pending. Hovering the indicator pauses the timeout. Its binding
      // preview popover is disabled when "which_key.enabled" is true.
 diff --git a/crates/go_to_line/src/cursor_position.rs b/crates/go_to_line/src/cursor_position.rs
-index 29f1c0a..c605450 100644
+index 29f1c0a..166fab0 100644
 --- a/crates/go_to_line/src/cursor_position.rs
 +++ b/crates/go_to_line/src/cursor_position.rs
 @@ -1,3 +1,4 @@
@@ -50,7 +50,15 @@ index 29f1c0a..c605450 100644
              workspace: workspace.weak_handle(),
              update_position: Task::ready(()),
              _observe_active_editor: None,
-@@ -106,11 +112,14 @@ impl CursorPosition {
+@@ -82,6 +88,7 @@ impl CursorPosition {
+         &mut self,
+         editor: &Entity<Editor>,
+         debounce: Option<Duration>,
++        recompute_document_stats: bool,
+         window: &mut Window,
+         cx: &mut Context<Self>,
+     ) {
+@@ -106,11 +113,28 @@ impl CursorPosition {
                              | editor::EditorMode::SingleLine
                              | editor::EditorMode::Minimap { .. } => {
                                  cursor_position.position = None;
@@ -60,12 +68,26 @@ index 29f1c0a..c605450 100644
                              editor::EditorMode::Full { .. } => {
                                  let mut last_selection = None::<Selection<Point>>;
                                  let snapshot = editor.display_snapshot(cx);
-+                                cursor_position.document_stats =
-+                                    Some(document_stats::compute(snapshot.buffer_snapshot()));
++                                // Document stats only make sense for a single whole
++                                // document (not a combined multi-buffer view, where
++                                // `position.line` is already relative to the
++                                // underlying excerpt's own buffer, not this
++                                // snapshot), and only cost anything (the O(lines)
++                                // block scan) when the setting is on. Recomputing is
++                                // also skipped on a plain cursor move
++                                // (`recompute_document_stats` is false for
++                                // `SelectionsChanged`): the result only depends on
++                                // buffer content, so the previous value is reused.
++                                if recompute_document_stats {
++                                    cursor_position.document_stats = (is_singleton
++                                        && StatusBarSettings::get_global(cx)
++                                            .document_stats_button)
++                                        .then(|| document_stats::compute(snapshot.buffer_snapshot()));
++                                }
                                  if snapshot.buffer_snapshot().excerpts().count() > 0 {
                                      for selection in editor.selections.all_adjusted(&snapshot) {
                                          let selection_summary = snapshot
-@@ -205,6 +214,37 @@ impl CursorPosition {
+@@ -205,6 +229,37 @@ impl CursorPosition {
      pub(crate) fn position(&self) -> Option<UserCaretPosition> {
          self.position
      }
@@ -103,7 +125,7 @@ index 29f1c0a..c605450 100644
  }
  
  impl Render for CursorPosition {
-@@ -214,11 +254,30 @@ impl Render for CursorPosition {
+@@ -214,11 +269,30 @@ impl Render for CursorPosition {
          }
  
          div().when_some(self.position, |el, position| {
@@ -138,29 +160,30 @@ index 29f1c0a..c605450 100644
  
              let context = self.context.clone();
  
-@@ -277,13 +336,15 @@ impl StatusItemView for CursorPosition {
-                 &editor,
-                 window,
-                 |cursor_position, editor, event, window, cx| match event {
--                    EditorEvent::SelectionsChanged { .. } => Self::update_position(
--                        cursor_position,
--                        editor,
--                        Some(UPDATE_DEBOUNCE),
--                        window,
--                        cx,
--                    ),
-+                    EditorEvent::SelectionsChanged { .. } | EditorEvent::BufferEdited => {
-+                        Self::update_position(
-+                            cursor_position,
-+                            editor,
-+                            Some(UPDATE_DEBOUNCE),
-+                            window,
-+                            cx,
-+                        )
-+                    }
+@@ -281,13 +355,22 @@ impl StatusItemView for CursorPosition {
+                         cursor_position,
+                         editor,
+                         Some(UPDATE_DEBOUNCE),
++                        false,
++                        window,
++                        cx,
++                    ),
++                    EditorEvent::BufferEdited => Self::update_position(
++                        cursor_position,
++                        editor,
++                        Some(UPDATE_DEBOUNCE),
++                        true,
+                         window,
+                         cx,
+                     ),
                      _ => {}
                  },
              ));
+-            self.update_position(&editor, None, window, cx);
++            self.update_position(&editor, None, true, window, cx);
+         } else {
+             self.position = None;
+             self._observe_active_editor = None;
 diff --git a/crates/go_to_line/src/document_stats.rs b/crates/go_to_line/src/document_stats.rs
 new file mode 100644
 index 0000000..f265cb9
@@ -225,7 +248,7 @@ index 0000000..f265cb9
 +    blocks
 +}
 diff --git a/crates/go_to_line/src/go_to_line.rs b/crates/go_to_line/src/go_to_line.rs
-index 48017a6..078ffd3 100644
+index 48017a6..b996d1d 100644
 --- a/crates/go_to_line/src/go_to_line.rs
 +++ b/crates/go_to_line/src/go_to_line.rs
 @@ -1,4 +1,5 @@
@@ -234,13 +257,33 @@ index 48017a6..078ffd3 100644
  
  use cursor_position::UserCaretPosition;
  use editor::{
-@@ -606,6 +607,78 @@ mod tests {
+@@ -353,15 +354,16 @@ mod tests {
+     use super::*;
+     use cursor_position::{CursorPosition, SelectionStats, UserCaretPosition};
+     use editor::actions::{MoveRight, MoveToBeginning, SelectAll};
+-    use gpui::{TestAppContext, VisualTestContext};
++    use gpui::{TestAppContext, UpdateGlobal, VisualTestContext};
+     use indoc::indoc;
+     use language::Capability;
+     use multi_buffer::{MultiBuffer, PathKey};
+     use project::{FakeFs, Project};
+     use serde_json::json;
++    use settings::SettingsStore;
+     use std::{num::NonZeroU32, sync::Arc, time::Duration};
+     use util::{path, rel_path::rel_path};
+-    use workspace::{AppState, MultiWorkspace, Workspace};
++    use workspace::{AppState, MultiWorkspace, StatusItemView, Workspace};
+ 
+     #[gpui::test]
+     async fn test_go_to_line_view_row_highlights(cx: &mut TestAppContext) {
+@@ -606,6 +608,208 @@ mod tests {
          });
      }
  
 +    #[gpui::test]
 +    async fn test_document_stats(cx: &mut TestAppContext) {
 +        init_test(cx);
++        enable_document_stats(cx);
 +
 +        // Blocks (paragraphs): a run of consecutive non-empty lines. Two or more
 +        // consecutive empty lines separate blocks (rows 2-3); a single line break
@@ -251,6 +294,87 @@ index 48017a6..078ffd3 100644
 +
 +        let fs = FakeFs::new(cx.executor());
 +        fs.insert_tree(path!("/dir"), json!({ "a.txt": text })).await;
++
++        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++        workspace.update_in(cx, |workspace, window, cx| {
++            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            workspace.status_bar().update(cx, |status_bar, cx| {
++                status_bar.add_right_item(cursor_position, window, cx);
++            });
++        });
++
++        let worktree_id = workspace.update(cx, |workspace, cx| {
++            workspace.project().update(cx, |project, cx| {
++                project.worktrees(cx).next().unwrap().read(cx).id()
++            })
++        });
++        let _buffer = project
++            .update(cx, |project, cx| {
++                project.open_local_buffer(path!("/dir/a.txt"), cx)
++            })
++            .await
++            .unwrap();
++        let editor = workspace
++            .update_in(cx, |workspace, window, cx| {
++                workspace.open_path((worktree_id, rel_path("a.txt")), None, true, window, cx)
++            })
++            .await
++            .unwrap()
++            .downcast::<Editor>()
++            .unwrap();
++
++        cx.executor().advance_clock(Duration::from_millis(200));
++        let read_document_stats = |cx: &mut VisualTestContext| {
++            workspace.update(cx, |workspace, cx| {
++                workspace
++                    .status_bar()
++                    .read(cx)
++                    .item_of_type::<CursorPosition>()
++                    .expect("missing cursor position item")
++                    .read(cx)
++                    .document_stats()
++            })
++        };
++        let document_stats = read_document_stats(cx)
++            .expect("document stats should be computed once the setting is enabled");
++        assert_eq!(
++            document_stats.lines, 9,
++            "total line count should follow line breaks in the buffer, not the current selection"
++        );
++        assert_eq!(
++            document_stats.characters,
++            text.chars().count(),
++            "character count should cover the whole document"
++        );
++        assert_eq!(
++            document_stats.blocks, 3,
++            "blocks are separated by two or more consecutive empty lines; \
++             a single line break or a whitespace-only line must not split a block"
++        );
++
++        // A plain cursor move (no content change) must not perturb the cached
++        // document stats -- they only depend on buffer content.
++        editor.update_in(cx, |editor, window, cx| {
++            editor.move_right(&MoveRight, window, cx)
++        });
++        cx.executor().advance_clock(Duration::from_millis(200));
++        assert_eq!(
++            read_document_stats(cx),
++            Some(document_stats),
++            "moving the cursor without editing the buffer should not change the document stats"
++        );
++    }
++
++    #[gpui::test]
++    async fn test_document_stats_disabled_by_default(cx: &mut TestAppContext) {
++        init_test(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/dir"), json!({ "a.txt": "one\ntwo\nthree" }))
++            .await;
 +
 +        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
 +        let (multi_workspace, cx) =
@@ -291,27 +415,92 @@ index 48017a6..078ffd3 100644
 +                .item_of_type::<CursorPosition>()
 +                .expect("missing cursor position item")
 +                .read(cx)
-+                .document_stats()
-+                .expect("document stats should always be computed for a full editor, regardless of selection");
++                .document_stats();
 +            assert_eq!(
-+                document_stats.lines, 9,
-+                "total line count should follow line breaks in the buffer, not the current selection"
++                document_stats, None,
++                "document stats must not be computed while the setting is off (the default)"
 +            );
-+            assert_eq!(
-+                document_stats.characters,
-+                text.chars().count(),
-+                "character count should cover the whole document"
++        });
++    }
++
++    #[gpui::test]
++    async fn test_document_stats_hidden_for_multibuffer(cx: &mut TestAppContext) {
++        init_test(cx);
++        enable_document_stats(cx);
++
++        let fs = FakeFs::new(cx.executor());
++        fs.insert_tree(path!("/dir"), json!({ "a.txt": "" })).await;
++        let project = Project::test(fs, [path!("/dir").as_ref()], cx).await;
++        let (multi_workspace, cx) =
++            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
++        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
++
++        // A multi-excerpt view (as used for search results / references), not a
++        // normal single-file editor: `position.line` here is relative to the
++        // excerpt's own underlying buffer, so a document-wide line/char/block
++        // count over the combined multi-buffer view would not describe the same
++        // document and must stay hidden.
++        let file_content = (1..=20)
++            .map(|line| format!("line {line}"))
++            .collect::<Vec<_>>()
++            .join("\n");
++        let buffer = cx.new(|cx| Buffer::local(file_content, cx));
++        let multibuffer = cx.new(|cx| {
++            let mut multibuffer = MultiBuffer::new(Capability::ReadWrite);
++            multibuffer.set_excerpts_for_path(
++                PathKey::for_buffer(&buffer, cx),
++                buffer.clone(),
++                [Point::new(0, 0)..Point::new(3, 0)],
++                0,
++                cx,
 +            );
++            multibuffer
++        });
++        let editor = workspace.update_in(cx, |_, window, cx| {
++            cx.new(|cx| Editor::for_multibuffer(multibuffer.clone(), None, window, cx))
++        });
++
++        let cursor_position = workspace.update_in(cx, |workspace, window, cx| {
++            let cursor_position = cx.new(|_| CursorPosition::new(workspace));
++            workspace.status_bar().update(cx, |status_bar, cx| {
++                status_bar.add_right_item(cursor_position.clone(), window, cx);
++            });
++            cursor_position
++        });
++        cursor_position.update_in(cx, |cursor_position, window, cx| {
++            cursor_position.set_active_pane_item(Some(&editor), window, cx);
++        });
++
++        cx.executor().advance_clock(Duration::from_millis(200));
++        cursor_position.read_with(cx, |cursor_position, _| {
 +            assert_eq!(
-+                document_stats.blocks, 3,
-+                "blocks are separated by two or more consecutive empty lines; \
-+                 a single line break or a whitespace-only line must not split a block"
++                cursor_position.document_stats(),
++                None,
++                "document stats must stay hidden for a multi-excerpt buffer, since \
++                 position.line is relative to the excerpt's own buffer, not this view"
 +            );
 +        });
 +    }
 +
      #[gpui::test]
      async fn test_unicode_line_numbers(cx: &mut TestAppContext) {
+         init_test(cx);
+@@ -892,6 +1096,16 @@ mod tests {
+         })
+     }
+ 
++    fn enable_document_stats(cx: &mut TestAppContext) {
++        cx.update(|cx| {
++            SettingsStore::update_global(cx, |settings, cx| {
++                settings.update_user_settings(cx, |settings| {
++                    settings.status_bar.get_or_insert_default().document_stats_button = Some(true);
++                });
++            });
++        });
++    }
++
+     #[gpui::test]
+     async fn test_scroll_position_on_outside_click(cx: &mut TestAppContext) {
          init_test(cx);
 diff --git a/crates/settings/src/vscode_import.rs b/crates/settings/src/vscode_import.rs
 index 997625f..f43cb33 100644
