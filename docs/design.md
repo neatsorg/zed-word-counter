@@ -83,8 +83,34 @@
 
 ## 今回のパッチに含めないこと
 
-- zed-i18n の取り込み処理（パッチのバージョン指定・適用、ローカライズ済みツリーとの適用順序の検証）。
-  zed-i18n 側で行う。
 - 新規UI文字列（"chars"/"blocks" 等の既定ラベル）の翻訳対応。zed-i18n 側の抽出・翻訳パイプラインに委ねる。
 - `crates/settings_ui`（設定GUI）への項目追加。
 - 本家 `zed-industries/zed` の現行 `main` への追従（リベース）。PR提出時に本家のフォークで対応する。
+
+## zed-i18n への取り込み（2026-09-19、実施済み）
+
+`tools/zed_i18n/apply_universal.py`（`_plan_zed_runtime_patches` 内、`_register_document_stats_patches`
+関数）に、この `patches/0001-status-bar-document-stats.patch` と同内容を、zed-i18n 既存の流儀
+（`patch(relative, old, new)` による文字列レベルの構造化パッチ、新規ファイルはランタイム
+オーバーレイ）で再実装した。zed-i18n は独自の localization エンジンが Python の文字列/AST変換を
+前提にしており、`git apply` のような生パッチ適用の仕組みを持たないため、Rustソースの変更内容自体は
+このリポジトリの `patches/` を正本としつつ、zed-i18n 側では同じ変更を自分の慣用句で保守する
+（`_register_document_stats_patches` の docstring にこのリポジトリへの参照とバージョン
+（v1.20.2）を明記し、将来の追従漏れに備える）。
+
+- `crates/go_to_line/src/document_stats.rs`（新規ファイル）は
+  `tools/zed_i18n/runtime_overlay/crates/go_to_line/src/document_stats.rs` として全文コピーし、
+  既存のオーバーレイ機構（新規ファイル一覧への追加）で配置する。
+- 既存ファイル（`cursor_position.rs`／`go_to_line.rs`／`settings_content/workspace.rs`／
+  `workspace/workspace.rs`／`workspace/workspace_settings.rs`／`settings/vscode_import.rs`／
+  `assets/settings/default.json`）への変更は、すべて `patch(relative, old, new)` の呼び出しとして
+  移植した。
+- `tests/test_runtime_overlay_patches.py` の `PATCH_TARGETS` に対象ファイルを追加し、
+  適用結果とべき等性（2回適用しても2回目は無変更）を検証するアサーションを追加した。
+  ローカライズ済みの実チェックアウト全体（zed-i18n の既存75ファイル分の変更）に対しても
+  `apply_zed_runtime_patches` がエラーなく適用できることを確認済み。
+- 新規UI文字列（既定ラベル）は、この統合作業ではローカライズ抽出パイプラインに一切触れていない
+  （`apply_universal()` の文字列分類は本パッチ適用前の状態に対して行われるため、影響しないことを
+  ソースを読んで確認済み）。翻訳対応は引き続き未着手。
+- ビルドの本流（`generate-runtime-bundles` → `apply-universal` → 配布パッチ）を通したフルビルド
+  確認は未実施（`crates/localization` 側の別の前提ステップが必要なため、今回のスコープ外とした）。
