@@ -31,6 +31,23 @@ scripts/prepare   # .checkout/zed に対象コミットを用意し、パッチ�
 scripts/check     # 型検査とテストを実行する
 ```
 
+パッチ後は、Zed のsettings.jsonに、たとえば以下のように書くと動作する。
+ラベルをつけないことも可能。
+
+```json
+  "status_bar": {
+    "document_stats_button": true,
+    "document_stats": {
+      "items": [
+        { "item": "characters", "label": "文字" },
+        { "item": "blocks", "label": "ブロック" },
+        { "item": "lines", "label": "行"  }
+      ],
+      "separator": " — "
+    }
+  }
+```
+
 開発中の変更は `.checkout/zed` の中で直接行い、確認できたら
 `git -C .checkout/zed diff > patches/0001-status-bar-document-stats.patch`
 のように差分を書き出して `patches/` を更新する。実装コードを `patches/` とは別に
