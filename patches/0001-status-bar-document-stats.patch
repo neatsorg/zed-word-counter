@@ -848,7 +848,7 @@ index eff3a0a..b31445e 100644
              line_endings_button: status_bar.line_endings_button.unwrap(),
              active_encoding_button: status_bar.active_encoding_button.unwrap(),
              pending_keystrokes_indicator: status_bar.pending_keystrokes_indicator.unwrap(),
-+            document_stats_button: status_bar.document_stats_button.unwrap(),
++            document_stats_button: status_bar.document_stats_button.unwrap_or(false),
 +            document_stats: DocumentStats::from_content(status_bar.document_stats.as_ref()),
          }
      }
