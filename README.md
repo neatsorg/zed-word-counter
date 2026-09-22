@@ -26,6 +26,9 @@ Zed のステータスバーに、保存前のアクティブ文書全体を対�
 このリポジトリのパッチを適用します。Zedのプラットフォーム別ビルド要件は、使用するZedの
 上流ドキュメントも確認してください。
 
+現在の固定値（2026-09-19時点）: Zed `v1.20.2` @ [`7c451e6`](https://github.com/zed-industries/zed/commit/7c451e694f3c52ee0aeb01d7e28b5fa18cd0ad2f)（正本は `upstream.toml`）。
+`scripts/prepare` 実行後、`.checkout/zed` で `git log -1` すれば同じコミットであることを確認できる。
+
 ```sh
 scripts/prepare   # .checkout/zed に対象コミットを用意し、パッチを当てる
 scripts/check     # 型検査とテストを実行する
